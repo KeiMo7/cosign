@@ -1682,6 +1682,9 @@ func GetBundles(_ context.Context, signedImgRef name.Reference, registryClientOp
 				fmt.Errorf("image tag not found: %w", err),
 			}
 		}
+		if isFetchFailure(err) {
+			return nil, nil, &ErrAttestationFetch{fmt.Errorf("resolving image: %w", err)}
+		}
 		return nil, nil, err
 	}
 	h, err := v1.NewHash(digest.Identifier())
@@ -1691,6 +1694,9 @@ func GetBundles(_ context.Context, signedImgRef name.Reference, registryClientOp
 
 	index, err := ociremote.Referrers(digest, "", registryClientOpts...)
 	if err != nil {
+		if isFetchFailure(err) {
+			return nil, nil, &ErrAttestationFetch{fmt.Errorf("listing referrers: %w", err)}
+		}
 		return nil, nil, err
 	}
 
@@ -1700,6 +1706,7 @@ func GetBundles(_ context.Context, signedImgRef name.Reference, registryClientOp
 	}
 
 	var bundles = make([]*sgbundle.Bundle, 0, len(index.Manifests))
+	var skippedErrors []error
 	for _, result := range index.Manifests {
 		var st name.Reference
 		if len(nameOpts) > 0 {
@@ -1712,20 +1719,49 @@ func GetBundles(_ context.Context, signedImgRef name.Reference, registryClientOp
 		}
 		bundle, err := ociremote.Bundle(st, registryClientOpts...)
 		if err != nil {
-			// There may be non-Sigstore referrers in the index, so we can ignore them.
-			// TODO: Should we surface any errors here (e.g. if the bundle is invalid)?
+			// There may be non-Sigstore referrers in the index (which fail the
+			// "expected bundle layer" check) as well as genuine transport
+			// failures. Keep the latter so callers can tell "no attestations"
+			// apart from "could not fetch attestations".
+			if isFetchFailure(err) {
+				skippedErrors = append(skippedErrors, err)
+			}
 			continue
 		}
 		bundles = append(bundles, bundle)
 	}
 
 	if len(bundles) == 0 {
+		if len(skippedErrors) > 0 {
+			return nil, nil, &ErrAttestationFetch{
+				fmt.Errorf("fetching attestations: %w", errors.Join(skippedErrors...)),
+			}
+		}
 		return nil, nil, &ErrNoMatchingAttestations{
 			fmt.Errorf("no valid bundles exist in registry"),
 		}
 	}
 
 	return bundles, &h, nil
+}
+
+// isFetchFailure reports whether err indicates that a bundle could not be
+// retrieved (transport, authentication, or blob reads) rather than that the
+// referrer was simply not a Sigstore bundle.
+func isFetchFailure(err error) bool {
+	var terr *transport.Error
+	if errors.As(err, &terr) {
+		return true
+	}
+	// ociremote.Bundle surfaces short reads and unmarshalling failures with
+	// these prefixes; a referrer whose layer is not a bundle is expected noise
+	// and must not be classified as a fetch failure.
+	msg := err.Error()
+	return strings.Contains(msg, "failed to fetch") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "i/o timeout")
 }
 
 // bundleDescriptor holds the digest and path to a bundle blob in a local OCI layout
@@ -1887,8 +1923,62 @@ func getLocalBundleDescriptorsWithFilter(path string, isAttestation bool) ([]bun
 	return descriptors, &targetDigest, nil
 }
 
+// VerifiedAttestation pairs a verified attestation payload with the bundle it
+// came from, so callers that need signer metadata (for policy results) can
+// inspect the certificate without changing the historical return signature of
+// VerifyImageAttestations.
+type VerifiedAttestation struct {
+	// Signature is the DSSE envelope wrapped as an oci.Signature.
+	Signature oci.Signature
+	// Bundle is the verified bundle the attestation was extracted from.
+	Bundle *sgbundle.Bundle
+}
+
+// VerifyImageAttestationBundles verifies attestations and returns them
+// alongside their source bundles. It performs exactly the same checks as
+// VerifyImageAttestations; callers that do not need bundle metadata should
+// keep using that function.
+func VerifyImageAttestationBundles(ctx context.Context, signedImgRef name.Reference, co *CheckOpts, nameOpts ...name.Option) (checked []VerifiedAttestation, bundleVerified bool, err error) {
+	bundles, hash, err := GetBundles(ctx, signedImgRef, co.RegistryClientOpts, nameOpts...)
+	if err != nil {
+		return nil, false, err
+	}
+	return verifyImageAttestationBundles(ctx, bundles, hash, co)
+}
+
+// VerifyLocalImageAttestationBundles is the local-layout counterpart of
+// VerifyImageAttestationBundles.
+func VerifyLocalImageAttestationBundles(ctx context.Context, path string, co *CheckOpts) (checked []VerifiedAttestation, bundleVerified bool, err error) {
+	bundles, hash, err := GetLocalBundles(path, co.BundleOptions()...)
+	if err != nil {
+		return nil, false, err
+	}
+	return verifyImageAttestationBundles(ctx, bundles, hash, co)
+}
+
+// VerifyAttestationBundles verifies a set of already-fetched bundles against
+// the given image digest. It is the shared verification core used for live and
+// cached evidence, so cached attestations receive exactly the same checks as
+// freshly fetched ones.
+func VerifyAttestationBundles(ctx context.Context, bundles []*sgbundle.Bundle, hash *v1.Hash, co *CheckOpts) (checked []VerifiedAttestation, bundleVerified bool, err error) {
+	return verifyImageAttestationBundles(ctx, bundles, hash, co)
+}
+
 // verifyImageAttestationsSigstoreBundles verifies attestations from attached sigstore bundles
 func verifyImageAttestationsSigstoreBundles(ctx context.Context, bundles []*sgbundle.Bundle, hash *v1.Hash, co *CheckOpts) (checkedAttestations []oci.Signature, atLeastOneBundleVerified bool, err error) {
+	verified, atLeastOneBundleVerified, err := verifyImageAttestationBundles(ctx, bundles, hash, co)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, v := range verified {
+		checkedAttestations = append(checkedAttestations, v.Signature)
+	}
+	return checkedAttestations, atLeastOneBundleVerified, nil
+}
+
+// verifyImageAttestationBundles is the shared implementation behind the
+// public verification entry points.
+func verifyImageAttestationBundles(ctx context.Context, bundles []*sgbundle.Bundle, hash *v1.Hash, co *CheckOpts) (checkedAttestations []VerifiedAttestation, atLeastOneBundleVerified bool, err error) {
 	// Enforce this up front.
 	if co.SigVerifier == nil && co.TrustedMaterial == nil {
 		return nil, false, errors.New("one of verifier or trusted root is required")
@@ -1901,7 +1991,7 @@ func verifyImageAttestationsSigstoreBundles(ctx context.Context, bundles []*sgbu
 
 	artifactPolicyOption := verify.WithArtifactDigest(hash.Algorithm, digestBytes)
 
-	attestations := make([]oci.Signature, len(bundles))
+	attestations := make([]VerifiedAttestation, len(bundles))
 	bundlesVerified := make([]bool, len(bundles))
 
 	workers := co.MaxWorkers
@@ -1950,7 +2040,7 @@ func verifyImageAttestationsSigstoreBundles(ctx context.Context, bundles []*sgbu
 				return
 			}
 
-			attestations[index] = att
+			attestations[index] = VerifiedAttestation{Signature: att, Bundle: bundle}
 			t.Done(nil)
 		}(bundle, i)
 
@@ -1959,7 +2049,7 @@ func verifyImageAttestationsSigstoreBundles(ctx context.Context, bundles []*sgbu
 	}
 
 	for _, a := range attestations {
-		if a != nil {
+		if a.Signature != nil {
 			checkedAttestations = append(checkedAttestations, a)
 		}
 	}

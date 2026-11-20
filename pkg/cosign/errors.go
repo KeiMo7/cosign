@@ -79,6 +79,22 @@ func (e *ErrNoMatchingAttestations) Unwrap() error {
 	return e.err
 }
 
+// ErrAttestationFetch indicates that attestations could not be retrieved, as
+// opposed to there being none. Callers can use errors.As to distinguish the
+// two: a missing attestation is a policy decision, while a fetch failure may
+// be transient and is eligible for a cached fallback.
+type ErrAttestationFetch struct {
+	err error
+}
+
+func (e *ErrAttestationFetch) Error() string {
+	return e.err.Error()
+}
+
+func (e *ErrAttestationFetch) Unwrap() error {
+	return e.err
+}
+
 type ErrNoCertificateFoundOnSignature struct {
 	err error
 }

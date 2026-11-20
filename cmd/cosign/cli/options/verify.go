@@ -134,6 +134,8 @@ type VerifyAttestationOptions struct {
 	Registry            RegistryOptions
 	Predicate           PredicateRemoteOptions
 	Policies            []string
+	AttestationPolicy   string
+	PolicyCacheDir      string
 	LocalImage          bool
 }
 
@@ -157,6 +159,14 @@ func (o *VerifyAttestationOptions) AddFlags(cmd *cobra.Command) {
 	cmd.Flags().StringSliceVar(&o.Policies, "policy", nil,
 		"specify CUE or Rego files with policies to be used for validation")
 	_ = cmd.MarkFlagFilename("policy", "cue", "rego")
+
+	cmd.Flags().StringVar(&o.AttestationPolicy, "attestation-policy", "",
+		"path to a declarative attestation policy (YAML or JSON) that selects attestation types and validates their predicate fields")
+	_ = cmd.MarkFlagFilename("attestation-policy", "yaml", "yml", "json")
+
+	cmd.Flags().StringVar(&o.PolicyCacheDir, "attestation-policy-cache", "",
+		"directory used to cache fetched attestations; when the registry is unreachable, cached attestations are evaluated and marked stale")
+	_ = cmd.MarkFlagDirname("attestation-policy-cache")
 
 	cmd.Flags().StringVarP(&o.Output, "output", "o", verifyOutputTypes[0],
 		"output format for the signing image information ("+strings.Join(verifyOutputTypes, "|")+")")

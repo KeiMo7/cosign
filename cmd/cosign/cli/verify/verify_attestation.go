@@ -54,12 +54,19 @@ type VerifyAttestationCommand struct {
 	Output                       string
 	PredicateType                string
 	Policies                     []string
-	LocalImage                   bool
-	NameOptions                  []name.Option
-	Offline                      bool
-	IgnoreTlog                   bool
-	MaxWorkers                   int
-	UseSignedTimestamps          bool
+	// AttestationPolicy is the path to a declarative attestation policy. When
+	// set, attestations are filtered and validated by type before any CUE/Rego
+	// policy runs, and a per-attestation report is produced.
+	AttestationPolicy string
+	// PolicyCacheDir, if set, is used to cache fetched attestations and to fall
+	// back to cached evidence when the registry is unreachable.
+	PolicyCacheDir      string
+	LocalImage          bool
+	NameOptions         []name.Option
+	Offline             bool
+	IgnoreTlog          bool
+	MaxWorkers          int
+	UseSignedTimestamps bool
 }
 
 // Exec runs the verification command
@@ -140,24 +147,43 @@ func (c *VerifyAttestationCommand) Exec(ctx context.Context, images []string) (e
 	// was performed so we don't need to use this fragile logic here.
 	fulcioVerified := (co.SigVerifier == nil)
 
+	// A declarative policy is parsed before any image is touched so a broken
+	// document is rejected instead of silently allowing verification.
+	var spec *policy.PolicySpec
+	if c.AttestationPolicy != "" {
+		spec, err = policy.ParsePolicyFile(c.AttestationPolicy)
+		if err != nil {
+			return err
+		}
+	}
+
 	for _, imageRef := range images {
 		var verified []oci.Signature
 		var bundleVerified bool
+		var report *policy.Report
 
-		if c.LocalImage {
-			verified, bundleVerified, err = cosign.VerifyLocalImageAttestations(ctx, imageRef, co)
+		if spec != nil {
+			selected, bv, r, err := c.verifyWithPolicy(ctx, imageRef, co, spec)
 			if err != nil {
 				return err
 			}
+			verified, bundleVerified, report = selected, bv, r
 		} else {
-			ref, err := name.ParseReference(imageRef, c.NameOptions...)
-			if err != nil {
-				return err
-			}
+			if c.LocalImage {
+				verified, bundleVerified, err = cosign.VerifyLocalImageAttestations(ctx, imageRef, co)
+				if err != nil {
+					return err
+				}
+			} else {
+				ref, err := name.ParseReference(imageRef, c.NameOptions...)
+				if err != nil {
+					return err
+				}
 
-			verified, bundleVerified, err = cosign.VerifyImageAttestations(ctx, ref, co, c.NameOptions...)
-			if err != nil {
-				return err
+				verified, bundleVerified, err = cosign.VerifyImageAttestations(ctx, ref, co, c.NameOptions...)
+				if err != nil {
+					return err
+				}
 			}
 		}
 
@@ -175,60 +201,165 @@ func (c *VerifyAttestationCommand) Exec(ctx context.Context, images []string) (e
 		}
 
 		var checked []oci.Signature
-		var validationErrors []error
-		// To aid in determining if there's a mismatch in what predicateType
-		// we're looking for and what we checked, keep track of them here so
-		// that we can help the user figure out if there's a typo, etc.
-		checkedPredicateTypes := []string{}
-		for _, vp := range verified {
-			payload, gotPredicateType, err := policy.AttestationToPayloadJSON(ctx, c.PredicateType, vp)
-			if err != nil {
-				return fmt.Errorf("converting to consumable policy validation: %w", err)
-			}
-			checkedPredicateTypes = append(checkedPredicateTypes, gotPredicateType)
-			if len(payload) == 0 {
-				// This is not the predicate type we're looking for.
-				continue
-			}
-
-			if len(cuePolicies) > 0 {
-				ui.Infof(ctx, "will be validating against CUE policies: %v", cuePolicies)
-				cueValidationErr := cue.ValidateJSON(payload, cuePolicies)
-				if cueValidationErr != nil {
-					validationErrors = append(validationErrors, cueValidationErr)
+		// When a declarative policy is in effect, it is the sole judge of which
+		// attestations are relevant, so the legacy predicate-type check below
+		// is skipped. CUE/Rego policies, if also given, still run afterwards
+		// against each attestation selected by the declarative policy.
+		if spec == nil {
+			var validationErrors []error
+			// To aid in determining if there's a mismatch in what predicateType
+			// we're looking for and what we checked, keep track of them here so
+			// that we can help the user figure out if there's a typo, etc.
+			checkedPredicateTypes := []string{}
+			for _, vp := range verified {
+				payload, gotPredicateType, err := policy.AttestationToPayloadJSON(ctx, c.PredicateType, vp)
+				if err != nil {
+					return fmt.Errorf("converting to consumable policy validation: %w", err)
+				}
+				checkedPredicateTypes = append(checkedPredicateTypes, gotPredicateType)
+				if len(payload) == 0 {
+					// This is not the predicate type we're looking for.
 					continue
 				}
+
+				if len(cuePolicies) > 0 {
+					ui.Infof(ctx, "will be validating against CUE policies: %v", cuePolicies)
+					cueValidationErr := cue.ValidateJSON(payload, cuePolicies)
+					if cueValidationErr != nil {
+						validationErrors = append(validationErrors, cueValidationErr)
+						continue
+					}
+				}
+
+				if len(regoPolicies) > 0 {
+					ui.Infof(ctx, "will be validating against Rego policies: %v", regoPolicies)
+					regoValidationErrs := rego.ValidateJSON(payload, regoPolicies)
+					if len(regoValidationErrs) > 0 {
+						validationErrors = append(validationErrors, regoValidationErrs...)
+						continue
+					}
+				}
+
+				checked = append(checked, vp)
 			}
 
-			if len(regoPolicies) > 0 {
-				ui.Infof(ctx, "will be validating against Rego policies: %v", regoPolicies)
-				regoValidationErrs := rego.ValidateJSON(payload, regoPolicies)
-				if len(regoValidationErrs) > 0 {
-					validationErrors = append(validationErrors, regoValidationErrs...)
-					continue
+			if len(validationErrors) > 0 {
+				ui.Infof(ctx, "There are %d number of errors occurred during the validation:\n", len(validationErrors))
+				for _, v := range validationErrors {
+					ui.Infof(ctx, "- %v", v)
+				}
+				return fmt.Errorf("%d validation errors occurred", len(validationErrors))
+			}
+
+			if len(checked) == 0 {
+				return fmt.Errorf("none of the attestations matched the predicate type: %s, found: %s", c.PredicateType, strings.Join(checkedPredicateTypes, ","))
+			}
+		} else {
+			// The declarative policy decides which attestations are relevant.
+			// Any additional CUE/Rego policies then apply to exactly that set,
+			// mirroring the non-policy flow where they apply to the
+			// predicate-type-selected set.
+			checked = selectedByReport(report, verified)
+			if len(checked) == 0 {
+				return errors.New("no attestation satisfied the attestation policy")
+			}
+			if len(cuePolicies) > 0 || len(regoPolicies) > 0 {
+				var policyErrors []error
+				for _, vp := range checked {
+					payload, _, err := policy.AttestationToPayloadJSON(ctx, c.PredicateType, vp)
+					if err != nil {
+						// The attestation may use one of the policy's other
+						// declared types; only the legacy predicate is
+						// converted here.
+						continue
+					}
+					if len(payload) == 0 {
+						continue
+					}
+					if len(cuePolicies) > 0 {
+						if err := cue.ValidateJSON(payload, cuePolicies); err != nil {
+							policyErrors = append(policyErrors, err)
+						}
+					}
+					if len(regoPolicies) > 0 {
+						policyErrors = append(policyErrors, rego.ValidateJSON(payload, regoPolicies)...)
+					}
+				}
+				if len(policyErrors) > 0 {
+					return fmt.Errorf("CUE/Rego policy validation failed: %w", errors.Join(policyErrors...))
 				}
 			}
-
-			checked = append(checked, vp)
-		}
-
-		if len(validationErrors) > 0 {
-			ui.Infof(ctx, "There are %d number of errors occurred during the validation:\n", len(validationErrors))
-			for _, v := range validationErrors {
-				ui.Infof(ctx, "- %v", v)
-			}
-			return fmt.Errorf("%d validation errors occurred", len(validationErrors))
-		}
-
-		if len(checked) == 0 {
-			return fmt.Errorf("none of the attestations matched the predicate type: %s, found: %s", c.PredicateType, strings.Join(checkedPredicateTypes, ","))
 		}
 
 		// TODO: add CUE validation report to `PrintVerificationHeader`.
 		PrintVerificationHeader(ctx, imageRef, co, bundleVerified, fulcioVerified)
-		// The attestations are always JSON, so use the raw "text" mode for outputting them instead of conversion
+		if spec != nil {
+			// The declarative report was already printed in verifyWithPolicy.
+			// Name the evidence used so a cached run is never mistaken for a
+			// live one.
+			if report != nil && report.Cache != nil && report.Cache.Used {
+				ui.Infof(ctx, "Attestations were evaluated from a local cache (stale=%t).", report.Cache.Stale)
+			}
+		}
+		// The attestations are always JSON, so use the raw "text" mode for outputting them instead of conversion.
+		// With a declarative policy, only attestations that satisfied a rule are printed.
 		PrintVerification(ctx, checked, "text")
 	}
 
 	return nil
+}
+
+// verifyWithPolicy fetches and verifies attestations, applies the declarative
+// policy, prints the report and returns the verified attestations together
+// with the report. It is only called when --attestation-policy is set.
+func (c *VerifyAttestationCommand) verifyWithPolicy(ctx context.Context, imageRef string, co *cosign.CheckOpts, spec *policy.PolicySpec) ([]oci.Signature, bool, *policy.Report, error) {
+	evidence, err := fetchAndVerifyAttestations(ctx, imageRef, co, c.LocalImage, c.NameOptions, c.PolicyCacheDir, 0)
+	if err != nil {
+		// An image that simply has no attestations is not a fetch failure: the
+		// policy decides whether that is acceptable, and if not, names the
+		// missing types. Any other error (image missing, registry unavailable,
+		// verification failed) is returned as-is.
+		var noAttestations *cosign.ErrNoMatchingAttestations
+		if !errors.As(err, &noAttestations) {
+			return nil, false, nil, err
+		}
+	}
+
+	all := make([]oci.Signature, 0, len(evidence.Verified))
+	for _, v := range evidence.Verified {
+		all = append(all, v.Signature)
+	}
+
+	report, err := evaluateAttestationPolicy(ctx, spec, evidence, c.Output)
+	if err != nil {
+		// Return the verified set so callers can still report how far they got.
+		return all, false, report, err
+	}
+	return all, true, report, nil
+}
+
+// selectedByReport returns the verified attestations that the policy selected
+// and that satisfied at least one rule. Ordering follows the verified set so
+// output stays stable.
+func selectedByReport(report *policy.Report, verified []oci.Signature) []oci.Signature {
+	if report == nil {
+		return verified
+	}
+	wanted := make(map[string]struct{}, len(report.Results))
+	for _, r := range report.Results {
+		if r.Selected && len(r.MatchedRules) > 0 {
+			wanted[r.Digest] = struct{}{}
+		}
+	}
+	out := make([]oci.Signature, 0, len(wanted))
+	for _, sig := range verified {
+		payload, err := sig.Payload()
+		if err != nil {
+			continue
+		}
+		if _, ok := wanted[policy.EnvelopeDigest(payload)]; ok {
+			out = append(out, sig)
+		}
+	}
+	return out
 }

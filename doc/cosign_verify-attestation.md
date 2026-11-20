@@ -51,6 +51,12 @@ cosign verify-attestation [flags]
 
   # verify image with public key and validate attestation based on CUE policy
   cosign verify-attestation --key cosign.pub --type <PREDICATE_TYPE> --policy <CUE_POLICY> <IMAGE>
+
+  # verify image by requiring specific attestation types and predicate field values
+  cosign verify-attestation --key cosign.pub --attestation-policy <POLICY_YAML> <IMAGE>
+
+  # evaluate a declarative policy, emitting a per-attestation JSON report
+  cosign verify-attestation --key cosign.pub --attestation-policy <POLICY_YAML> -o json <IMAGE>
 ```
 
 ### Options
@@ -59,6 +65,8 @@ cosign verify-attestation [flags]
       --allow-certificate-chain[=true|false]            allow X.509 certificate chains in bundle verification material for v0.3+ bundles
       --allow-http-registry[=true|false]                whether to allow using HTTP protocol while connecting to registries. Don't use this for anything but testing
       --allow-insecure-registry[=true|false]            whether to allow insecure connections to registries (e.g., with expired or self-signed TLS certificates). Don't use this for anything but testing
+      --attestation-policy string                       path to a declarative attestation policy (YAML or JSON) that selects attestation types and validates their predicate fields
+      --attestation-policy-cache string                 directory used to cache fetched attestations; when the registry is unreachable, cached attestations are evaluated and marked stale
       --certificate-github-workflow-name string         contains the workflow claim from the GitHub OIDC Identity token that contains the name of the executed workflow.
       --certificate-github-workflow-ref string          contains the ref claim from the GitHub OIDC Identity token that contains the git ref that the workflow run was based upon.
       --certificate-github-workflow-repository string   contains the repository claim from the GitHub OIDC Identity token that contains the repository that the workflow run was based upon

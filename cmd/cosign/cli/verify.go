@@ -179,7 +179,13 @@ against the transparency log.`,
   cosign verify-attestation --key cosign.pub --type <PREDICATE_TYPE> --policy <REGO_POLICY> <IMAGE>
 
   # verify image with public key and validate attestation based on CUE policy
-  cosign verify-attestation --key cosign.pub --type <PREDICATE_TYPE> --policy <CUE_POLICY> <IMAGE>`,
+  cosign verify-attestation --key cosign.pub --type <PREDICATE_TYPE> --policy <CUE_POLICY> <IMAGE>
+
+  # verify image by requiring specific attestation types and predicate field values
+  cosign verify-attestation --key cosign.pub --attestation-policy <POLICY_YAML> <IMAGE>
+
+  # evaluate a declarative policy, emitting a per-attestation JSON report
+  cosign verify-attestation --key cosign.pub --attestation-policy <POLICY_YAML> -o json <IMAGE>`,
 
 		Args:             cobra.MinimumNArgs(1),
 		PersistentPreRun: options.BindViper,
@@ -205,6 +211,8 @@ against the transparency log.`,
 				Output:                       o.Output,
 				PredicateType:                o.Predicate.Type,
 				Policies:                     o.Policies,
+				AttestationPolicy:            o.AttestationPolicy,
+				PolicyCacheDir:               o.PolicyCacheDir,
 				LocalImage:                   o.LocalImage,
 				NameOptions:                  o.Registry.NameOptions(),
 				IgnoreTlog:                   o.CommonVerifyOptions.IgnoreTlog,
